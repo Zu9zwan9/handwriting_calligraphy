@@ -576,34 +576,175 @@ class HandwritingAnimator:
             return np.array([]), np.array([]), pen_position
 
     def create_fill_patches(self) -> List[Tuple[int, PathPatch]]:
-        """Create fill patches for closed contours.
-        Returns list of (stroke_index, PathPatch) to enable per-stroke reveal.
+        """Create typographically-correct fill patches per glyph.
+        - Combine a glyph's closed contours into a single compound path.
+        - Subtract inner counters using winding orientation (nonzero rule).
+        - Optionally exclude tiny detached decorative marks.
+        Returns list of (reveal_index, PathPatch) so we can reveal per glyph at the right time.
         """
         patches: List[Tuple[int, PathPatch]] = []
 
-        for idx, stroke in enumerate(self.ordered_strokes):
-            if not stroke.closed or len(stroke.segments) < 3:
+        if not self.ordered_strokes:
+            return patches
+
+        # Map stroke_id -> index in ordered_strokes to schedule reveals
+        ordered_index_by_id: Dict[int, int] = {s.stroke_id: i for i, s in enumerate(self.ordered_strokes)}
+
+        # Helpers
+        def polygon_signed_area(pts: List[Point]) -> float:
+            n = len(pts)
+            if n < 3:
+                return 0.0
+            area = 0.0
+            for i in range(n):
+                x1, y1 = pts[i]
+                x2, y2 = pts[(i + 1) % n]
+                area += (x1 * y2 - x2 * y1)
+            return 0.5 * area
+
+        def point_in_polygon(pt: Point, poly: List[Point]) -> bool:
+            # Ray casting algorithm; treats boundary as inside
+            x, y = pt
+            inside = False
+            n = len(poly)
+            if n < 3:
+                return False
+            for i in range(n):
+                x1, y1 = poly[i]
+                x2, y2 = poly[(i + 1) % n]
+                if ((y1 > y) != (y2 > y)):
+                    xinters = (x2 - x1) * (y - y1) / ((y2 - y1) if (y2 - y1) != 0 else 1e-12) + x1
+                    if xinters >= x:
+                        inside = not inside
+            return inside
+
+        def bbox_contains(b1: Tuple[float, float, float, float], b2: Tuple[float, float, float, float]) -> bool:
+            min1x, min1y, max1x, max1y = b1
+            min2x, min2y, max2x, max2y = b2
+            eps = 1e-6
+            return (min1x - eps <= min2x <= max1x + eps and
+                    min1y - eps <= min2y <= max1y + eps and
+                    min1x - eps <= max2x <= max1x + eps and
+                    min1y - eps <= max2y <= max1y + eps)
+
+        # Process each glyph group independently so we can combine contours
+        for group in self.grouped_strokes:
+            # Collect closed contours for this glyph
+            contours = []  # list of dicts with verts, area, bbox, parent/children, etc.
+            reveal_indices: List[int] = []
+
+            for s in group:
+                if not s.closed or len(s.segments) < 3:
+                    continue
+
+                # Build polygon vertices from stroke segments
+                verts: List[Point] = [s.segments[0].start] + [seg.end for seg in s.segments]
+                # Drop duplicated last point if same as first
+                if len(verts) >= 2 and verts[0] == verts[-1]:
+                    verts = verts[:-1]
+
+                area_signed = polygon_signed_area(verts)
+                area_abs = abs(area_signed)
+                if area_abs <= 0.0:
+                    continue
+
+                contours.append({
+                    'stroke': s,
+                    'verts': verts,
+                    'bbox': s.bounds,
+                    'area': area_abs,
+                    'area_signed': area_signed,
+                    'parent': None,      # index of parent contour if any
+                    'children': []       # indices of child contours
+                })
+                reveal_indices.append(ordered_index_by_id.get(s.stroke_id, -1))
+
+            if not contours:
                 continue
 
-            # Create path vertices and codes
-            vertices: List[Point] = []
-            codes: List[int] = []
+            # Determine parent-child relationships via bbox filtering + point-in-polygon
+            for j, cj in enumerate(contours):
+                for i, ci in enumerate(contours):
+                    if i == j:
+                        continue
+                    if not bbox_contains(ci['bbox'], cj['bbox']):
+                        continue
+                    if point_in_polygon(cj['verts'][0], ci['verts']):
+                        # Choose the closest (smallest-area) parent among candidates
+                        if cj['parent'] is None:
+                            cj['parent'] = i
+                        else:
+                            prev_parent = cj['parent']
+                            if contours[i]['area'] < contours[prev_parent]['area']:
+                                cj['parent'] = i
 
-            # Start with first point
-            vertices.append(stroke.segments[0].start)
-            codes.append(MplPath.MOVETO)
+            # Build children lists
+            for idx, c in enumerate(contours):
+                p = c['parent']
+                if p is not None:
+                    contours[p]['children'].append(idx)
 
-            # Add all segment endpoints
-            for segment in stroke.segments:
-                vertices.append(segment.end)
-                codes.append(MplPath.LINETO)
+            # Top-level contours (outer-most candidates)
+            top_level = [i for i, c in enumerate(contours) if c['parent'] is None]
+            if not top_level:
+                continue
 
-            # Close the path
-            codes.append(MplPath.CLOSEPOLY)
-            vertices.append(stroke.segments[0].start)
+            # Decide which top-level contours to include in fill
+            # Always include the largest; include other large shapes if relatively big,
+            # otherwise include only if FILL_INCLUDE_MARKS is True.
+            top_level_sorted = sorted(top_level, key=lambda i: contours[i]['area'], reverse=True)
+            largest_area = contours[top_level_sorted[0]]['area']
+            include_top: Set[int] = set()
+            for i in top_level_sorted:
+                a = contours[i]['area']
+                if a >= largest_area * FILL_SECONDARY_MIN_RELATIVE or FILL_INCLUDE_MARKS:
+                    include_top.add(i)
+            if not include_top:
+                include_top.add(top_level_sorted[0])
 
-            # Create matplotlib path and patch
-            path = MplPath(vertices, codes)
+            # Compose compound path using nonzero winding: flip orientation by depth
+            vertices_all: List[Point] = []
+            codes_all: List[int] = []
+
+            def ensure_orientation(pts: List[Point], want_ccw: bool) -> List[Point]:
+                ccw = polygon_signed_area(pts) > 0
+                if ccw != want_ccw:
+                    return list(reversed(pts))
+                return pts
+
+            def add_subpath(pts: List[Point]) -> None:
+                if not pts:
+                    return
+                vertices_all.append(pts[0])
+                codes_all.append(MplPath.MOVETO)
+                for p in pts[1:]:
+                    vertices_all.append(p)
+                    codes_all.append(MplPath.LINETO)
+                vertices_all.append(pts[0])
+                codes_all.append(MplPath.CLOSEPOLY)
+
+            def add_contour_with_children(idx: int, depth: int) -> None:
+                # Even depth => outer (CCW); odd depth => hole (CW)
+                pts = contours[idx]['verts']
+                want_ccw = (depth % 2 == 0)
+                add_subpath(ensure_orientation(pts, want_ccw))
+                for child in contours[idx]['children']:
+                    add_contour_with_children(child, depth + 1)
+
+            if DEBUG:
+                try:
+                    excluded = [i for i in top_level if i not in include_top]
+                    print(f"[Fill] Glyph group: closed={len(contours)}; include_top={len(include_top)}; exclude_top={len(excluded)}")
+                except Exception:
+                    pass
+
+            for i in sorted(include_top, key=lambda k: contours[k]['area'], reverse=True):
+                add_contour_with_children(i, 0)
+
+            if not vertices_all:
+                continue
+
+            path = MplPath(vertices_all, codes_all)
             patch = PathPatch(
                 path,
                 facecolor=FILL_COLOR,
@@ -611,7 +752,11 @@ class HandwritingAnimator:
                 alpha=FILL_ALPHA,
                 zorder=0
             )
-            patches.append((idx, patch))
+
+            # Reveal after the entire glyph group has been drawn (all strokes)
+            group_reveal_idx = max([ordered_index_by_id.get(s.stroke_id, -1) for s in group if ordered_index_by_id.get(s.stroke_id, -1) >= 0], default=-1)
+            if group_reveal_idx >= 0:
+                patches.append((group_reveal_idx, patch))
 
         return patches
 
@@ -802,6 +947,9 @@ FILL_COLOR = '#FFDD44'  # Color for fill patches
 FILL_ALPHA = 0.8
 FILL_THRESHOLD = 0.95  # Used only for global fill reveal
 FILL_REVEAL = 'per_stroke'  # 'per_stroke', 'global', or 'none'
+# Fill analysis options
+FILL_INCLUDE_MARKS = False  # Include tiny detached decorative marks (dots, diacritics) in fill
+FILL_SECONDARY_MIN_RELATIVE = 0.15  # Include top-level shapes only if >= 15% of largest top-level area
 
 # Technical parameters
 CURVE_TOLERANCE = 0.5  # Curve flattening tolerance in pixels
