@@ -250,28 +250,27 @@ class StrokeOrderer:
         return ordered
 
     def _order_closed_strokes(self, strokes: List[Stroke]) -> List[Stroke]:
-        """Order closed strokes by containment and position"""
+        """Order closed strokes: draw larger outer contours first, then smaller holes.
+        This yields natural order (e.g., base shape before dot/inner counter)."""
         if not strokes:
             return []
 
-        # Sort by area (larger first, typically outer contours)
         def stroke_area(stroke: Stroke) -> float:
             # Approximate area using bounding box
-            bounds = stroke.bounds
-            return (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
+            min_x, min_y, max_x, max_y = stroke.bounds
+            return (max_x - min_x) * (max_y - min_y)
 
-        # Primary sort: by Y position (top first)
-        # Secondary sort: by area (larger first)
-        # Sort by visual position: top-to-bottom (higher Y first), then by area
-        return sorted(strokes, key=lambda s: (-s.centroid[1], -stroke_area(s)))
+        # Primary sort: by area (larger first)
+        # Secondary: by X position (left-to-right)
+        return sorted(strokes, key=lambda s: (-stroke_area(s), s.centroid[0]))
 
     def _order_open_strokes(self, strokes: List[Stroke]) -> List[Stroke]:
-        """Order open strokes by position and connectivity"""
+        """Order open strokes by position: left-to-right, then top-to-bottom."""
         if not strokes:
             return []
 
-        # Sort primarily by visual Y position (top-to-bottom), then X position (left-to-right)
-        return sorted(strokes, key=lambda s: (-s.centroid[1], s.centroid[0]))
+        # Sort primarily by X (left-to-right), then by Y (top-to-bottom)
+        return sorted(strokes, key=lambda s: (s.centroid[0], -s.centroid[1]))
 
 
 class HandwritingAnimator:
@@ -292,12 +291,52 @@ class HandwritingAnimator:
         self.scale = font_size / self.units_per_em
         self._extract_font_metrics()
 
-        # Generate strokes
-        self.strokes = self._extract_strokes()
-        self.ordered_strokes = StrokeOrderer(self.strokes).order_strokes()
+        # Generate strokes grouped per glyph (preserve HarfBuzz shaping order)
+        self.grouped_strokes = self._extract_strokes_grouped()
+        # Flatten for stats/debug
+        self.strokes = [s for group in self.grouped_strokes for s in group]
 
-        # Calculate total length for animation
+        # Determine ordering mode: glyph-first preserves word order
+        groups = self.grouped_strokes
+        # Resolve writing direction
+        resolved_dir = 'LTR'
+        try:
+            if isinstance(WRITING_DIRECTION, str) and WRITING_DIRECTION.upper() in ('LTR', 'RTL'):
+                resolved_dir = WRITING_DIRECTION.upper()
+            else:
+                hb_dir = getattr(self, '_hb_direction', 'ltr')
+                resolved_dir = 'RTL' if str(hb_dir).lower().startswith('rtl') else 'LTR'
+        except Exception:
+            resolved_dir = 'LTR'
+
+        if resolved_dir == 'RTL':
+            groups = list(reversed(groups))
+
+        ordered: List[Stroke] = []
+        if ORDER_MODE == 'glyph':
+            for group in groups:
+                if not group:
+                    continue
+                ordered.extend(StrokeOrderer(group).order_strokes())
+        else:
+            # Fallback to global ordering (not recommended for handwriting)
+            ordered = StrokeOrderer(self.strokes).order_strokes()
+
+        self.ordered_strokes = ordered
+
+        if DEBUG:
+            try:
+                print(f"Resolved direction: {resolved_dir}; ORDER_MODE={ORDER_MODE}; groups={len(groups)}; total_strokes={len(self.strokes)}; ordered={len(self.ordered_strokes)}")
+            except Exception:
+                pass
+
+        # Calculate total length for animation and cumulative per-stroke ends
         self.total_length = sum(stroke.total_length for stroke in self.ordered_strokes)
+        cum = 0.0
+        self.stroke_cum_ends: List[float] = []
+        for s in self.ordered_strokes:
+            cum += s.total_length
+            self.stroke_cum_ends.append(cum)
 
     def _load_harfbuzz_font(self) -> Tuple[hb.Face, hb.Font]:
         """Load font for text shaping"""
@@ -324,6 +363,16 @@ class HandwritingAnimator:
 
         hb.shape(self.hb_font, buf, features)
 
+        # Persist useful shaping properties
+        try:
+            self._hb_direction = str(buf.direction)
+            self._hb_script = str(buf.script)
+            self._hb_language = str(buf.language)
+        except Exception:
+            self._hb_direction = 'ltr'
+            self._hb_script = 'latn'
+            self._hb_language = 'en'
+
         return buf.glyph_infos, buf.glyph_positions
 
     def _extract_font_metrics(self) -> None:
@@ -349,7 +398,7 @@ class HandwritingAnimator:
             print(f"Font metrics: ascender={self.ascender:.1f}, descender={self.descender:.1f}")
 
     def _extract_strokes(self) -> List[Stroke]:
-        """Extract all strokes from shaped text"""
+        """Extract all strokes from shaped text (legacy flat list)."""
         infos, positions = self.shaped_info
         strokes = []
 
@@ -375,6 +424,37 @@ class HandwritingAnimator:
             x_cursor += x_advance
 
         return strokes
+
+    def _extract_strokes_grouped(self) -> List[List[Stroke]]:
+        """Extract strokes from shaped text, grouped by glyph in shaping order.
+        Returns a list of groups; each group is a list[Stroke] for a single shaped glyph.
+        """
+        infos, positions = self.shaped_info
+        grouped: List[List[Stroke]] = []
+        x_cursor = 0.0
+        stroke_id_offset = 0
+
+        for glyph_idx, (info, pos) in enumerate(zip(infos, positions)):
+            glyph_id = info.codepoint
+
+            # Calculate glyph position
+            x_offset = pos.x_offset * self.scale
+            y_offset = pos.y_offset * self.scale
+            x_advance = pos.x_advance * self.scale
+
+            glyph_x = x_cursor + x_offset
+            glyph_y = self.baseline_y + y_offset
+
+            # Extract glyph contours
+            glyph_strokes = self._extract_glyph_strokes(
+                glyph_id, glyph_x, glyph_y, stroke_id_offset
+            )
+            grouped.append(glyph_strokes)
+            stroke_id_offset += len(glyph_strokes)
+
+            x_cursor += x_advance
+
+        return grouped
 
     def _extract_glyph_strokes(self, glyph_id: int, x_offset: float, y_offset: float, stroke_id_offset: int) -> List[
         Stroke]:
@@ -495,17 +575,19 @@ class HandwritingAnimator:
         else:
             return np.array([]), np.array([]), pen_position
 
-    def create_fill_patches(self) -> List[PathPatch]:
-        """Create fill patches for closed contours"""
-        patches = []
+    def create_fill_patches(self) -> List[Tuple[int, PathPatch]]:
+        """Create fill patches for closed contours.
+        Returns list of (stroke_index, PathPatch) to enable per-stroke reveal.
+        """
+        patches: List[Tuple[int, PathPatch]] = []
 
-        for stroke in self.ordered_strokes:
+        for idx, stroke in enumerate(self.ordered_strokes):
             if not stroke.closed or len(stroke.segments) < 3:
                 continue
 
             # Create path vertices and codes
-            vertices = []
-            codes = []
+            vertices: List[Point] = []
+            codes: List[int] = []
 
             # Start with first point
             vertices.append(stroke.segments[0].start)
@@ -529,7 +611,7 @@ class HandwritingAnimator:
                 alpha=FILL_ALPHA,
                 zorder=0
             )
-            patches.append(patch)
+            patches.append((idx, patch))
 
         return patches
 
@@ -588,12 +670,14 @@ class HandwritingAnimator:
         pen_dot, = ax.plot([], [], 'o', color='red', markersize=8, zorder=2)
 
         # Fill patches (if enabled)
-        fill_patches = []
+        fill_entries: List[Tuple[int, PathPatch]] = []
+        closed_fill_by_index: Dict[int, PathPatch] = {}
         if SHOW_FILL:
-            fill_patches = self.create_fill_patches()
-            for patch in fill_patches:
+            fill_entries = self.create_fill_patches()
+            for idx, patch in fill_entries:
                 ax.add_patch(patch)
                 patch.set_visible(False)
+            closed_fill_by_index = {idx: patch for idx, patch in fill_entries}
 
         # Animation state
         total_frames = int(duration * fps)
@@ -622,10 +706,17 @@ class HandwritingAnimator:
             # Update pen position
             pen_dot.set_data([pen_pos[0]], [pen_pos[1]])
 
-            # Show fill when complete
-            if SHOW_FILL and progress >= FILL_THRESHOLD:
-                for patch in fill_patches:
-                    patch.set_visible(True)
+            # Fill reveal logic
+            if SHOW_FILL:
+                if FILL_REVEAL == 'per_stroke':
+                    target_len = self.total_length * progress
+                    for idx, patch in closed_fill_by_index.items():
+                        patch.set_visible(self.stroke_cum_ends[idx] <= target_len)
+                elif FILL_REVEAL == 'global':
+                    if progress >= FILL_THRESHOLD:
+                        for patch in closed_fill_by_index.values():
+                            patch.set_visible(True)
+                # else 'none': do not reveal fills
 
             # Update frame
             current_frame += 1
@@ -641,7 +732,7 @@ class HandwritingAnimator:
             is_finished = False
 
             # Hide fill patches
-            for patch in fill_patches:
+            for patch in closed_fill_by_index.values():
                 patch.set_visible(False)
 
             line_collection.set_segments([])
@@ -701,11 +792,16 @@ STROKE_COLOR = '#000000'
 STROKE_JOIN = 'round'
 STROKE_CAP = 'round'
 
+# Sequencing and order controls
+ORDER_MODE = 'glyph'       # 'glyph' (recommended) or 'global'
+WRITING_DIRECTION = 'AUTO'  # 'AUTO', 'LTR', or 'RTL'
+
 # Fill settings
 SHOW_FILL = True
-FILL_COLOR = '#000000'
+FILL_COLOR = '#FFDD44'  # Color for fill patches
 FILL_ALPHA = 0.8
-FILL_THRESHOLD = 0.95  # Show fill when 95% complete
+FILL_THRESHOLD = 0.95  # Used only for global fill reveal
+FILL_REVEAL = 'per_stroke'  # 'per_stroke', 'global', or 'none'
 
 # Technical parameters
 CURVE_TOLERANCE = 0.5  # Curve flattening tolerance in pixels
