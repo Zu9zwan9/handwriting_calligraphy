@@ -11,7 +11,7 @@ Key improvements:
 - Optimized rendering with proper antialiasing
 - Error handling and fallbacks
 
-Dependencies: fonttools, uharfbuzz, numpy, matplotlib, scipy
+Dependencies: fonttools, uharfbuzz, numpy, matplotlib
 """
 from __future__ import annotations
 import math
@@ -961,7 +961,7 @@ MIN_FIGURE_WIDTH = 8.0
 MIN_FIGURE_HEIGHT = 4.0
 
 # Debug settings
-DEBUG = True
+DEBUG = False
 
 # Font management
 FONT_DIR = Path(__file__).parent / 'fonts'

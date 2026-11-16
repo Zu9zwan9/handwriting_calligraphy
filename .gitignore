@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.idea/
+*.iml
+.DS_Store
+debug_stages/
+debug_pre_flatten/
